@@ -688,3 +688,200 @@ class SuggestionListView(ListView):
         else:
             # Just reload the page
             return redirect(f"{request.path}?page={current_page}")
+
+
+class SuggestionListView2(ListView):
+    template_name = "suggestion_list2.html"
+    model = CachedSuggestions
+    paginate_by = 10
+    context_object_name = "objects"
+
+    # Determines how the list is filtered for and some control elements that
+    # only are shown depending on the context.
+    status_filter: CVEDerivationClusterProposal.Status = (
+        CVEDerivationClusterProposal.Status.PENDING
+    )
+
+    def get_context_data(self, **kwargs: Any) -> Any:
+        context = super().get_context_data(**kwargs)
+
+        context["status_filter"] = self.status_filter
+
+        suggestion_ids = [obj.proposal_id for obj in context["object_list"]]
+
+        grouped_activity_log = SuggestionActivityLog().get_dict(
+            suggestion_ids=suggestion_ids
+        )
+
+        for obj in context["object_list"]:
+            obj.activity_log = []
+            if obj.proposal_id in grouped_activity_log:
+                obj.activity_log = grouped_activity_log[obj.proposal_id]
+
+        context["adjusted_elided_page_range"] = context[
+            "paginator"
+        ].get_elided_page_range(context["page_obj"].number)
+        return context
+
+    def get_queryset(self) -> Any:
+        queryset = (
+            super()
+            .get_queryset()
+            # TODO: order by timestamp of last update/creation descending
+            .filter(proposal__status=self.status_filter)
+            .order_by("-proposal__updated_at", "-proposal__created_at")
+        )
+        return queryset
+
+    def post(self, request: HttpRequest, *args: Any, **kwargs: Any) -> HttpResponse:
+        if not request.user or not (
+            isadmin(request.user) or ismaintainer(request.user)
+        ):
+            return HttpResponseForbidden()
+
+        # We want to provide graceful fallback for important workflows, when users have JavaScript disabled
+        js_enabled: bool = "no-js" not in request.POST
+        undo_status_change: bool = "undo-status-change" in request.POST
+        suggestion_id = request.POST.get("suggestion_id")
+        new_status = request.POST.get("new_status")
+        current_page = request.POST.get("page", "1")
+        suggestion = get_object_or_404(CVEDerivationClusterProposal, id=suggestion_id)
+        activity_log = (
+            SuggestionActivityLog()
+            .get_dict(suggestion_ids=[suggestion.pk])
+            .get(suggestion.pk, [])
+        )
+        cached_suggestion = get_object_or_404(
+            CachedSuggestions, proposal_id=suggestion_id
+        )
+        status_change = new_status and suggestion.status != new_status
+        # When clicking "Publish issue", we want to open a tab with the GitHub
+        # issue in the response. We need to pass the issue's link to the
+        # component, which is thus stored here (only when `status_change` is
+        # true and `new_status = "published"`).
+        gh_issue_link = None
+
+        def suggestion_view_context() -> dict:
+            """
+            Creates a proper context for the `suggestion` view. Since this is
+            used at least in two different code paths, this is factored out in
+            this function.
+            """
+            return {
+                "cached_suggestion": cached_suggestion.payload,
+                "suggestion": suggestion,
+                "activity_log": activity_log,
+                "status_filter": self.status_filter,
+                "user": request.user,
+                # This only matters in a non-JS environment
+                "page_obj": None,
+                "csrf_token": get_token(request),
+            }
+
+        # We only have to modify derivations when they are editable
+        if not (
+            self.status_filter == CVEDerivationClusterProposal.Status.REJECTED
+            or undo_status_change
+        ):
+            selected_derivations = [
+                str.split(",") for str in request.POST.getlist("derivation_ids")
+            ]
+            selected_derivations = set(map(int, chain(*selected_derivations)))
+            # We only allow for removal of derivations here, not for additions
+            derivation_ids_to_keep = set(
+                suggestion.derivations.filter(id__in=selected_derivations).values_list(
+                    "id", flat=True
+                )
+            )
+            suggestion.derivations.set(derivation_ids_to_keep)
+
+            # TODO: this is quite slow and bad.
+            # we are getting the JSON here and then sending it back.
+            # a more optimal way to do it is to perform the raw SQL query directly on pgsql
+            # something along the lines of:
+            # UPDATE SET payload = payload -# {an list of indices to remove contained in this list} WHERE proposal_id = proposal_id
+            # the problem is that computing the list of indices is pretty hard.
+            # this seems to encourage to move the payload format to an dict of derivation id → derivation contents
+            # this way, we already know which IDs to remove.
+            # this is left as future work.
+            new_packages = {
+                pname: v
+                for pname, v in cached_suggestion.payload["packages"].items()
+                if any(did in selected_derivations for did in v["derivation_ids"])
+            }
+            cached_suggestion.payload["packages"] = new_packages
+            cached_suggestion.save()
+
+        # We only update the status if one of the status change buttons or undo
+        # button was clicked.
+        # We handle the case of "published" separately: publication implies a
+        # series of fallible actions that we want to handle in a properly
+        # sequenced transaction.
+        if status_change and new_status != "published":
+            if new_status == "rejected":
+                suggestion.status = CVEDerivationClusterProposal.Status.REJECTED
+            elif new_status == "accepted":
+                suggestion.status = CVEDerivationClusterProposal.Status.ACCEPTED
+            # there's no UI for returning a suggestion back to pending state,
+            # but this is an additional safeguard to prevent that from happening
+            #                                vvvvvvvvvvvvvvvvvv
+            elif new_status == "pending" and undo_status_change:
+                suggestion.status = CVEDerivationClusterProposal.Status.PENDING
+
+            suggestion.save()
+
+        if status_change and new_status == "published":
+            try:
+                with transaction.atomic():
+                    tracker_issue = suggestion.create_nixpkgs_issue()
+                    tracker_issue_link = request.build_absolute_uri(
+                        reverse("webview:issue_detail", args=[tracker_issue.code])
+                    )
+                    gh_issue_link = create_gh_issue(
+                        cached_suggestion, tracker_issue_link
+                    ).html_url
+                    suggestion.status = CVEDerivationClusterProposal.Status.PUBLISHED
+                    suggestion.save()
+            except Exception as e:
+                logger.error(f"Failed to publish issue: {e}")
+                snippet = render_to_string(
+                    "components/suggestion_state_error_wrapper.html",
+                    {
+                        "suggestion": suggestion_view_context(),
+                        "suggestion_state_error": {
+                            "suggestion_id": suggestion.pk,
+                            "title": cached_suggestion.payload["title"],
+                            "target_status": "published",
+                        },
+                    },
+                )
+                return HttpResponse(snippet)
+
+        if js_enabled:
+            # Clicking on the undo button will return the original suggestion
+            # tile again, so that the page looks like before the action.
+            if undo_status_change:
+                snippet = render_to_string(
+                    "components/suggestion.html",
+                    suggestion_view_context(),
+                )
+                return HttpResponse(snippet)
+            elif status_change:
+                snippet = render_to_string(
+                    "components/suggestion_state_changed.html",
+                    {
+                        "suggestion_id": suggestion.pk,
+                        "title": cached_suggestion.payload["title"],
+                        "status": suggestion.status,
+                        "old_status": self.status_filter,
+                        "gh_issue_link": gh_issue_link,
+                        "csrf_token": get_token(request),
+                    },
+                )
+                return HttpResponse(snippet)
+            else:
+                # A package was checked/unchecked and we hx-swap="none" on these.
+                return HttpResponse(status=200)
+        else:
+            # Just reload the page
+            return redirect(f"{request.path}?page={current_page}")
